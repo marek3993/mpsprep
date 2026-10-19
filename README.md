@@ -19,8 +19,10 @@ AerSimulator(method="matrix_product_state").run(c)
 ```
 
 ## What it does
-1. **Light cone** (only when `qubits=` is given). Qiskit's `LightCone` pass removes the gates that cannot affect the
-   requested qubits. Qubits that are left idle are then removed.
+1. **Light cone** (only when `qubits=` is given). Gates that cannot affect the requested qubits are removed and so are qubits
+   left idle. The rule is exact: it drops only gates outside the cone and diagonal gates in front of a Z measurement, with no
+   numerical tolerance. Qiskit's `LightCone` pass treats e.g. `RY(1e-6)` as commuting with Z and drops it, giving a ~5e-7 error,
+   so mpsprep does not use it. For a QFT, the first 4 qubits need only themselves (cone 4 instead of 24 with Qiskit's pass).
 2. **Routing onto a line.** Aer MPS applies 2-qubit gates only to neighbouring sites. For a distant gate it
    moves one qubit next to the other without lookahead and does not move it back (see `MPS::apply_2_qubit_gate`;
    the tutorial says otherwise, [Qiskit/qiskit-aer#2482](https://github.com/Qiskit/qiskit-aer/issues/2482)).
@@ -51,13 +53,16 @@ light cone **260 s (slower)**; mpsprep 0.004 s.
   finished within 5 minutes at 32 qubits.
 - Without the light cone, the routing is only a modest improvement over SABRE (about 1.1×). It can be slower than plain Aer.
   Choosing by swap count is cheap, but it does not predict the run time well.
-- Unitary circuits only: no mid-circuit measurements, resets or classical control.
+- Unitary circuits only. Resets, mid-circuit measurements, classical control and delays raise `ValueError`; final measurements
+  are removed. Qubit indices must be distinct integers `0 <= q < n` (negative indices are rejected).
+- The result is the joint distribution of the requested qubits, not samples of all qubits and not the full state.
 - Timing on a laptop varies up to 3× with its thermal and power state. Compare methods back to back.
 
 ## Tests
 ```
-python tests/test_correctness.py   # or: python -m pytest tests
-# 17 circuits incl. random ones with 3-qubit gates, vs Statevector, tol 1e-8
+python tests/test_correctness.py   # 17 circuits incl. random ones with 3-qubit gates, vs Statevector, tol 1e-8
+python tests/test_regressions.py   # input validation, swap metric, tiny angles, benchmark error handling
+# or: python -m pytest tests
 ```
 
 Built by Marek Benda with the help of an AI assistant (Claude).

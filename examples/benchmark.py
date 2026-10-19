@@ -33,20 +33,37 @@ def qaoa_grid_shuffled(r, c, seed, p=2):
 
 
 def run(qc, qubits, out):
-    c = qc.copy()
-    c.save_probabilities(qubits, label="p")
-    t = time.perf_counter()
-    AerSimulator(**OPTS).run(c).result()
-    out.put(time.perf_counter() - t)
+    try:
+        c = qc.copy()
+        c.save_probabilities(qubits, label="p")
+        t = time.perf_counter()
+        res = AerSimulator(**OPTS).run(c).result()
+        dt = time.perf_counter() - t
+        out.put(("ok", dt) if res.success else ("error", str(res.status)))
+    except Exception as e:  # report the failure instead of leaving the parent waiting
+        out.put(("error", f"{type(e).__name__}: {e}"))
 
 
 def timed(qc, qubits, timeout):
+    """Returns ("ok", seconds) | ("timeout", None) | ("error", message)."""
+    import queue
     q = mp.Queue()
     pr = mp.Process(target=run, args=(qc, qubits, q))
     pr.start(); pr.join(timeout)
     if pr.is_alive():
-        pr.kill(); return None
-    return q.get()
+        pr.kill(); pr.join()
+        return "timeout", None
+    try:
+        return q.get(timeout=5)
+    except queue.Empty:
+        return "error", f"worker exited with code {pr.exitcode} without a result"
+    finally:
+        q.close()
+
+
+def show(r, tmo):
+    status, v = r
+    return f"{v:.3f} s" if status == "ok" else (f"> {tmo} s" if status == "timeout" else f"error ({v})")
 
 
 if __name__ == "__main__":
@@ -54,11 +71,9 @@ if __name__ == "__main__":
     r, c, seed, tmo = args[:4]
     qc = qaoa_grid_shuffled(r, c, seed)
     qubits = [0, 1, 2, 3]
-    t = timed(qc, qubits, tmo)
-    print(f"plain Aer MPS ({qc.num_qubits} qubits): " + (f"{t:.3f} s" if t is not None else f"> {tmo} s"))
+    print(f"plain Aer MPS ({qc.num_qubits} qubits): " + show(timed(qc, qubits, tmo), tmo))
     for cone in (False, True):
         p = prepare(qc, qubits, seed=seed, light_cone_reduction=cone)
-        t = timed(p.circuit, p.positions, tmo)
         print(f"mpsprep, light cone={cone}: prepare {p.info['prepare_s']:.3f} s, run "
-              + (f"{t:.3f} s" if t is not None else f"> {tmo} s")
+              + show(timed(p.circuit, p.positions, tmo), tmo)
               + f"  ({p.circuit.num_qubits} qubits, {p.method}, swaps {p.info['swaps']})")

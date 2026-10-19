@@ -2,7 +2,7 @@
 
 Two exact (result-preserving) steps before simulation:
   1. light cone: when only some qubits are measured, drop the gates that cannot affect them
-     (Qiskit's LightCone pass) and drop the qubits that end up idle;
+     (exact rule, see `light_cone`) and drop the qubits that end up idle;
   2. routing onto a line: Aer MPS applies 2-qubit gates only to neighbouring sites and moves
      qubits without lookahead. We route the circuit ourselves and pick the cheaper of
        - reverse Cuthill-McKee ordering + lookahead routing ("rcm+look"),
@@ -56,11 +56,42 @@ _BASIS = ["cp", "csx", "cx", "cy", "cz", "ecr", "h", "id", "p", "r", "rx", "rxx"
 # 1- and 2-qubit gates that Aer 0.17 MPS applies natively; everything else is decomposed into them
 
 
+def _validate(qc):
+    """Only unitary gates (and barriers) are supported: reject resets, mid-circuit measurements,
+    classical control, delays and other non-unitary instructions instead of returning a wrong answer."""
+    from qiskit.circuit import Gate
+    for ins in qc.data:
+        op = ins.operation
+        if op.name == "barrier":
+            continue
+        if not isinstance(op, Gate) or ins.clbits or getattr(op, "condition", None) is not None:
+            raise ValueError(f"unsupported instruction '{op.name}': mpsprep handles unitary circuits only "
+                             "(no reset, mid-circuit measurement, classical control or delay); "
+                             "final measurements are removed automatically")
+
+
+def _check_qubits(qubits, n):
+    """Requested qubits must be distinct integers 0 <= q < n (negative indices are rejected)."""
+    import numbers
+    qs = list(qubits)
+    if not qs:
+        raise ValueError("qubits must not be empty (use None for all qubits)")
+    for q in qs:
+        if isinstance(q, bool) or not isinstance(q, numbers.Integral):
+            raise TypeError(f"qubit index {q!r} is not an integer")
+        if not 0 <= q < n:
+            raise ValueError(f"qubit index {q} out of range 0..{n - 1} (negative indices are not accepted)")
+    if len(set(qs)) != len(qs):
+        raise ValueError(f"qubit indices must be distinct, got {qs}")
+    return [int(q) for q in qs]
+
+
 def _unroll(qc):
     from qiskit import transpile
     from qiskit.transpiler import PassManager
     from qiskit.transpiler.passes import RemoveFinalMeasurements
     qc = PassManager([RemoveFinalMeasurements()]).run(qc)
+    _validate(qc)
     return transpile(qc, basis_gates=_BASIS, optimization_level=0)
 
 
@@ -72,24 +103,39 @@ def _build(ops, n, global_phase=0.0):
     return qc
 
 
+_DIAGONAL = {"id", "z", "s", "sdg", "t", "tdg", "p", "u1", "rz", "cz", "cp", "rzz"}
+# gates diagonal in the computational basis (exactly, for every angle)
+
+
 def light_cone(qc, qubits):
-    """Circuit restricted to the backward light cone of measuring `qubits`.
+    """Exact backward light cone of measuring `qubits` in the Z basis; idle qubits are dropped.
+
+    Walk the circuit backwards with an active set A (initially `qubits`) and a flag per active qubit:
+    "only diagonal gates follow on this qubit". A diagonal gate whose active qubits are all flagged is
+    dropped (it only multiplies basis states by phases that the Z-basis marginal cannot see); a gate
+    touching no active qubit is dropped; every other gate is kept and its qubits become active
+    (flagged only if the kept gate is diagonal). No numerical commutation tolerance is used: Qiskit's
+    LightCone pass treats e.g. RY(1e-6) as commuting with Z and drops it (error ~5e-7 in probabilities).
+
     Returns (reduced circuit on k qubits, new index of each requested qubit, kept original indices)."""
-    from qiskit import ClassicalRegister
-    from qiskit.transpiler import PassManager
-    from qiskit.transpiler.passes import LightCone
-    m = qc.copy()
-    m.add_register(ClassicalRegister(len(qubits)))
-    m.measure(list(qubits), list(range(len(qubits))))
-    red = PassManager([LightCone()]).run(m)
-    ops = []
-    for ins in red.data:
-        if ins.operation.name in ("measure", "barrier"):
+    data = [(ins.operation, tuple(qc.find_bit(q).index for q in ins.qubits)) for ins in qc.data
+            if ins.operation.name != "barrier"]
+    active = {q: True for q in qubits}          # qubit -> flag
+    kept = []
+    for op, qs in reversed(data):
+        touched = [q for q in qs if q in active]
+        if not touched:
             continue
-        ops.append((ins.operation, tuple(red.find_bit(q).index for q in ins.qubits)))
-    keep = sorted({q for _, qs in ops for q in qs} | set(qubits))
+        diag = op.name in _DIAGONAL
+        if diag and all(active[q] for q in touched):
+            continue
+        kept.append((op, qs))
+        for q in qs:
+            active[q] = diag and active.get(q, True)
+    kept.reverse()
+    keep = sorted(set(active) | set(qubits))
     new = {q: i for i, q in enumerate(keep)}
-    return (_build([(op, tuple(new[q] for q in qs)) for op, qs in ops], len(keep)),
+    return (_build([(op, tuple(new[q] for q in qs)) for op, qs in kept], len(keep), qc.global_phase),
             [new[q] for q in qubits], keep)
 
 
@@ -106,7 +152,7 @@ def rcm_order(ops, n):
 def route_lookahead(ops, n, order, window=20, decay=0.8):
     """Route onto a line starting from `order` (order[site] = qubit). For each distant gate, choose
     the meeting point that minimises swaps now + discounted distance of the next `window` gates.
-    Returns (physical ops with explicit swaps, final order, number of swaps)."""
+    Returns (physical ops with explicit swaps, final order, number of INSERTED swaps)."""
     from qiskit.circuit.library import SwapGate
     order = list(order)
     loc = [0] * n
@@ -179,7 +225,7 @@ def prepare(qc, qubits=None, seed=0, light_cone_reduction=True):
     t0 = time.perf_counter()
     qc = _unroll(qc)
     n0 = qc.num_qubits
-    want = list(range(n0)) if qubits is None else list(qubits)
+    want = list(range(n0)) if qubits is None else _check_qubits(qubits, n0)
     info = dict(original_qubits=n0)
     if qubits is not None and light_cone_reduction:
         qc, idx, keep = light_cone(qc, want)
@@ -191,9 +237,13 @@ def prepare(qc, qubits=None, seed=0, light_cone_reduction=True):
         info["prepare_s"] = time.perf_counter() - t0
         return Prepared(qc, idx, "none", info)
     ops = _ops(qc)
-    phys_r, final_r, sw_r = route_lookahead(ops, n, rcm_order(ops, n))
+    original = sum(1 for op, _ in ops if op.name == "swap")
+    phys_r, final_r, inserted_r = route_lookahead(ops, n, rcm_order(ops, n))
     qc_s, final_s, sw_s = _sabre(qc, seed)
-    info.update(swaps={"rcm+look": sw_r, "sabre": sw_s})
+    sw_r = original + inserted_r
+    # compare the same quantity: total swap gates in the circuit each candidate would run
+    info.update(swaps={"rcm+look": sw_r, "sabre": sw_s},
+                swaps_detail={"original": original, "rcm+look_inserted": inserted_r, "sabre_total": sw_s})
     if sw_r <= sw_s:
         site = [0] * n
         for s, q in enumerate(final_r):
